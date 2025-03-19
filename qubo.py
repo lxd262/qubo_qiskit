@@ -1,6 +1,3 @@
-"""
-QUBO (Quadratic Unconstrained Binary Optimization) implementation with Qiskit.
-"""
 import numpy as np
 from qiskit_aer import Aer
 from qiskit_algorithms import QAOA, NumPyMinimumEigensolver
@@ -17,12 +14,6 @@ class QUBOSolver:
     """
     
     def __init__(self, seed: int = 42):
-        """
-        Initialize the QUBO solver.
-        
-        Args:
-            seed: Random seed for reproducibility
-        """
         self.seed = seed
         # Set random seed for numpy which is used by the algorithms
         np.random.seed(seed)
@@ -95,7 +86,6 @@ class QUBOSolver:
         sampler = Sampler()
         optimizer = COBYLA()
         
-        # Use QAOA with updated interface
         qaoa = QAOA(sampler=sampler, optimizer=optimizer, reps=p)
         min_eigen_optimizer = MinimumEigenOptimizer(qaoa)
         result = min_eigen_optimizer.solve(qubo)
