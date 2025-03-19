@@ -1,0 +1,16 @@
+name: qubo_qiskit_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=1.23.0
+  - matplotlib>=3.7.0
+  - pillow>=10.0.0
+  - scipy>=1.10.0
+  - scikit-image>=0.21.0
+  - qiskit>=0.45.0
+  - pip
+  - pip:
+    - qiskit-optimization>=0.6.0
+    - qiskit-aer>=0.13.0
