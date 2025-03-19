@@ -6,7 +6,7 @@ from qiskit.primitives import Sampler
 from qiskit_optimization import QuadraticProgram
 from qiskit_optimization.algorithms import MinimumEigenOptimizer
 from typing import Dict, List, Tuple, Union
-
+from scipy.sparse import spmatrix, csr_matrix
 
 class QUBOSolver:
     """
@@ -18,20 +18,24 @@ class QUBOSolver:
         # Set random seed for numpy which is used by the algorithms
         np.random.seed(seed)
         
-    def create_qubo_model(self, Q: np.ndarray, constant: float = 0.0) -> QuadraticProgram:
+    def create_qubo_model(self, Q: Union[np.ndarray, spmatrix], constant: float = 0.0) -> QuadraticProgram:
         """
         Create a QUBO model from a Q matrix.
         
         Args:
-            Q: The QUBO matrix (symmetric)
+            Q: The QUBO matrix (symmetric), can be sparse or dense
             constant: Constant term in the objective function
             
         Returns:
             A QuadraticProgram object representing the QUBO problem
         """
-        num_vars = Q.shape[0]
-        # Ensure Q is symmetric
-        Q = (Q + Q.T) / 2
+        # Convert Q to CSR format if it's sparse, or to dense array if it's not
+        if isinstance(Q, spmatrix):
+            Q = Q.tocsr()
+            num_vars = Q.shape[0]
+        else:
+            Q = (Q + Q.T) / 2  # Ensure Q is symmetric if dense
+            num_vars = Q.shape[0]
         
         # Create a quadratic program
         qubo = QuadraticProgram(name="QUBO Problem")
@@ -41,19 +45,45 @@ class QUBOSolver:
             qubo.binary_var(name=f'x{i}')
         
         # Set the objective with the Q matrix
-        linear = {f'x{i}': Q[i, i] for i in range(num_vars)}
-        quadratic = {(f'x{i}', f'x{j}'): Q[i, j] for i in range(num_vars) for j in range(i+1, num_vars) if Q[i, j] != 0}
+        linear = {}
+        quadratic = {}
         
+        # Handle diagonal elements (linear terms)
+        if isinstance(Q, spmatrix):
+            for i in range(num_vars):
+                val = float(Q[i, i])
+                if abs(val) > 1e-10:  # Use small threshold for numerical stability
+                    linear[f'x{i}'] = val
+            
+            # Handle off-diagonal elements (quadratic terms)
+            rows, cols = Q.nonzero()
+            for i, j in zip(rows, cols):
+                if i < j:  # Only upper triangle
+                    val = float(Q[i, j])
+                    if abs(val) > 1e-10:  # Use small threshold for numerical stability
+                        quadratic[(f'x{i}', f'x{j}')] = 2 * val  # Double the interaction term
+        else:
+            for i in range(num_vars):
+                val = float(Q[i, i])
+                if abs(val) > 1e-10:
+                    linear[f'x{i}'] = val
+            
+            for i in range(num_vars):
+                for j in range(i+1, num_vars):
+                    val = float(Q[i, j])
+                    if abs(val) > 1e-10:
+                        quadratic[(f'x{i}', f'x{j}')] = 2 * val  # Double the interaction term
+        
+        # Create the quadratic program with the objective function
         qubo.minimize(linear=linear, quadratic=quadratic, constant=constant)
-        
         return qubo
-    
-    def solve_qubo_classical(self, Q: np.ndarray, constant: float = 0.0) -> Tuple[Dict[str, int], float]:
+        
+    def solve_qubo_classical(self, Q: Union[np.ndarray, spmatrix], constant: float = 0.0) -> Tuple[Dict[str, int], float]:
         """
         Solve a QUBO problem using classical optimization.
         
         Args:
-            Q: The QUBO matrix
+            Q: The QUBO matrix, can be sparse or dense
             constant: Constant term in the objective function
             
         Returns:
@@ -61,11 +91,20 @@ class QUBOSolver:
         """
         qubo = self.create_qubo_model(Q, constant)
         
-        # Use NumPyMinimumEigensolver
-        optimizer = MinimumEigenOptimizer(NumPyMinimumEigensolver())
+        # Use NumPyMinimumEigensolver with exact solver
+        exact_mes = NumPyMinimumEigensolver()
+        optimizer = MinimumEigenOptimizer(exact_mes)
+        
+        # Solve and ensure binary solution
         result = optimizer.solve(qubo)
         
-        return result.x, result.fval
+        # Convert numpy array solution to dictionary format
+        if isinstance(result.x, np.ndarray):
+            solution = {f'x{i}': int(round(val)) for i, val in enumerate(result.x)}
+        else:
+            solution = {var_name: int(round(float(value))) for var_name, value in result.x.items()}
+        
+        return solution, result.fval
     
     def solve_qubo_quantum(self, Q: np.ndarray, constant: float = 0.0, p: int = 1, shots: int = 1024) -> Tuple[Dict[str, int], float]:
         """
@@ -137,7 +176,8 @@ class QUBOSolver:
             result = np.zeros(n, dtype=int)
             for key, value in solution.items():
                 idx = int(key[1:])  # Extract index from key like 'x0', 'x1', etc.
-                result[idx] = value
+                # Convert value to binary (0 or 1) - fix for cases where value might be a float
+                result[idx] = int(round(float(value)))
             return result
         else:
             # If solution is already a numpy array or list

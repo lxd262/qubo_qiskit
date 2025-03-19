@@ -5,9 +5,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from sklearn.metrics import mean_squared_error
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, List
 import matplotlib.pyplot as plt
 from skimage import color, transform, filters
+from scipy.sparse import csr_matrix, lil_matrix
 
 
 class ImageReconstructor:
@@ -133,7 +134,7 @@ class ImageReconstructor:
                                             mask: np.ndarray,
                                             smoothness_weight: float = 0.5) -> np.ndarray:
         """
-        Build a QUBO matrix for image reconstruction.
+        Build a QUBO matrix for image reconstruction using sparse matrices.
         
         Args:
             corrupted_image: The corrupted image to reconstruct
@@ -147,49 +148,67 @@ class ImageReconstructor:
         height, width = corrupted_image.shape
         n = height * width  # Total number of variables
         
-        # Initialize Q matrix
-        Q = np.zeros((n, n))
+        # Initialize Q matrix as sparse matrix in LIL format (efficient for construction)
+        Q = lil_matrix((n, n))
         
-        # Data fidelity term: penalty for observed pixels if they deviate from observations
-        for i in range(height):
-            for j in range(width):
-                if mask[i, j]:  # If pixel is observed
-                    pixel_idx = i * width + j
-                    # If observed pixel is 1, we want to minimize (1-x_i)^2 = 1 - 2*x_i + x_i^2
-                    # If observed pixel is 0, we want to minimize x_i^2
-                    
-                    if corrupted_image[i, j] > 0.5:  # If pixel is 1 in the corrupted image
-                        Q[pixel_idx, pixel_idx] += 1  # x_i^2 term
-                        # Linear term -2*x_i will be added to the diagonal
-                        Q[pixel_idx, pixel_idx] -= 2  
-                    else:  # If pixel is 0 in the corrupted image
-                        Q[pixel_idx, pixel_idx] += 1  # x_i^2 term
-                    
-        # Smoothness term: penalty for neighboring pixels with different values
+        # Data fidelity weights - balance between keeping known pixels and optimizing unknown ones
+        data_fidelity_weight = 5.0  # Higher weight for known pixels
+        
+        # Process each pixel
+        pixel_indices = np.arange(n)
+        observed_pixels = mask.flatten()
+        corrupted_values = corrupted_image.flatten()
+        
+        # Set data fidelity terms for observed pixels
+        observed_idx = pixel_indices[observed_pixels]
+        for idx in observed_idx:
+            if corrupted_values[idx] > 0.5:
+                # For pixels that should be 1: penalize (x_i - 1)^2
+                Q[idx, idx] += data_fidelity_weight
+                Q[idx, idx] -= 2 * data_fidelity_weight  # Linear term for x_i
+            else:
+                # For pixels that should be 0: penalize x_i^2
+                Q[idx, idx] += data_fidelity_weight
+        
+        # Smoothness terms with normalization by number of neighbors
+        base_smoothness = smoothness_weight / 2.0  # Reduced base weight
         for i in range(height):
             for j in range(width):
                 pixel_idx = i * width + j
-                
-                # Check neighbors (4-connectivity)
                 neighbors = []
-                if i > 0:  # Top neighbor
-                    neighbors.append((i-1) * width + j)
-                if i < height-1:  # Bottom neighbor
-                    neighbors.append((i+1) * width + j)
-                if j > 0:  # Left neighbor
-                    neighbors.append(i * width + j-1)
-                if j < width-1:  # Right neighbor
-                    neighbors.append(i * width + j+1)
                 
-                # Add smoothness terms to Q
+                # Collect all valid neighbors
+                if i > 0:  # Top
+                    neighbors.append((i-1) * width + j)
+                if i < height-1:  # Bottom
+                    neighbors.append((i+1) * width + j)
+                if j > 0:  # Left
+                    neighbors.append(i * width + (j-1))
+                if j < width-1:  # Right
+                    neighbors.append(i * width + (j+1))
+                
+                if not neighbors:
+                    continue
+                
+                # Normalize smoothness weight by number of neighbors
+                local_smoothness = base_smoothness / len(neighbors)
+                
+                # Add smoothness terms for each neighbor
                 for neighbor_idx in neighbors:
-                    # For each pair of neighbors (i,j), we want to minimize (x_i - x_j)^2
-                    # This expands to x_i^2 - 2*x_i*x_j + x_j^2
-                    Q[pixel_idx, pixel_idx] += smoothness_weight  # x_i^2 term
-                    Q[neighbor_idx, neighbor_idx] += smoothness_weight  # x_j^2 term
-                    Q[pixel_idx, neighbor_idx] -= 2 * smoothness_weight  # -2*x_i*x_j term
+                    # (x_i - x_j)^2 = x_i^2 + x_j^2 - 2x_i*x_j
+                    Q[pixel_idx, pixel_idx] += local_smoothness
+                    Q[neighbor_idx, neighbor_idx] += local_smoothness
+                    Q[pixel_idx, neighbor_idx] -= 2 * local_smoothness
         
-        return Q
+        # Add small bias towards equal distribution of 0s and 1s for unknown pixels
+        unknown_pixels = pixel_indices[~observed_pixels]
+        if len(unknown_pixels) > 0:
+            balance_weight = 0.1
+            for idx in unknown_pixels:
+                Q[idx, idx] -= balance_weight  # Small bias towards 1
+        
+        # Convert to CSR format for efficient computations
+        return Q.tocsr()
     
     def reconstruct_image(self, solution: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
         """
@@ -269,3 +288,109 @@ class ImageReconstructor:
             'mse': mse,
             'accuracy': accuracy
         }
+
+    def split_into_tiles(self, image: np.ndarray, mask: np.ndarray, tile_size: int) -> List[Tuple[np.ndarray, np.ndarray, Tuple[int, int]]]:
+        """
+        Split an image into tiles for processing.
+        
+        Args:
+            image: Input image to split
+            mask: Mask indicating known pixels
+            tile_size: Size of each tile (tile_size x tile_size)
+            
+        Returns:
+            List of tuples containing (tile_image, tile_mask, (start_row, start_col))
+        """
+        height, width = image.shape
+        tiles = []
+        
+        # Calculate padding needed
+        pad_height = (tile_size - height % tile_size) % tile_size
+        pad_width = (tile_size - width % tile_size) % tile_size
+        
+        # Pad the image and mask if necessary
+        if pad_height > 0 or pad_width > 0:
+            padded_image = np.pad(image, ((0, pad_height), (0, pad_width)), mode='constant')
+            padded_mask = np.pad(mask, ((0, pad_height), (0, pad_width)), mode='constant')
+        else:
+            padded_image = image
+            padded_mask = mask
+        
+        # Split into tiles
+        for i in range(0, padded_image.shape[0], tile_size):
+            for j in range(0, padded_image.shape[1], tile_size):
+                tile_image = padded_image[i:i+tile_size, j:j+tile_size]
+                tile_mask = padded_mask[i:i+tile_size, j:j+tile_size]
+                tiles.append((tile_image, tile_mask, (i, j)))
+        
+        return tiles
+
+    def merge_tiles(self, tiles: List[Tuple[np.ndarray, Tuple[int, int]]], original_shape: Tuple[int, int]) -> np.ndarray:
+        """
+        Merge reconstructed tiles back into a full image.
+        
+        Args:
+            tiles: List of tuples containing (tile_image, (start_row, start_col))
+            original_shape: Shape of the original image
+            
+        Returns:
+            Merged image
+        """
+        # Calculate the padded shape
+        tile_size = tiles[0][0].shape[0]
+        rows = max(pos[0] for _, pos in tiles) + tile_size
+        cols = max(pos[1] for _, pos in tiles) + tile_size
+        
+        # Create empty image
+        merged = np.zeros((rows, cols))
+        
+        # Place tiles in the correct positions
+        for tile, (start_row, start_col) in tiles:
+            merged[start_row:start_row+tile_size, start_col:start_col+tile_size] = tile
+        
+        # Crop to original size
+        return merged[:original_shape[0], :original_shape[1]]
+
+    def reconstruct_image_tiled(self, corrupted_image: np.ndarray, mask: np.ndarray, 
+                              tile_size: int = 4, smoothness_weight: float = 0.5,
+                              qubo_solver=None) -> np.ndarray:
+        """
+        Reconstruct an image using a tiled approach to reduce memory usage.
+        
+        Args:
+            corrupted_image: The corrupted image to reconstruct
+            mask: Mask indicating which pixels are observed
+            tile_size: Size of tiles to process (must be small enough for QUBO solver)
+            smoothness_weight: Weight for the smoothness constraint
+            qubo_solver: Instance of QUBOSolver to use (if None, will create one)
+            
+        Returns:
+            Reconstructed image
+        """
+        if qubo_solver is None:
+            from qubo import QUBOSolver
+            qubo_solver = QUBOSolver()
+        
+        # Split image into tiles
+        tiles = self.split_into_tiles(corrupted_image, mask, tile_size)
+        reconstructed_tiles = []
+        
+        # Process each tile
+        for tile_image, tile_mask, position in tiles:
+            # Build QUBO matrix for this tile
+            Q = self.build_qubo_matrix_for_reconstruction(tile_image, tile_mask, smoothness_weight)
+            
+            # Solve QUBO problem for this tile
+            solution, _ = qubo_solver.solve_qubo_classical(Q)
+            
+            # Convert solution to binary array and reshape to tile size
+            tile_solution = qubo_solver.format_solution(solution)
+            tile_reconstructed = self.reconstruct_image(tile_solution, tile_image.shape)
+            
+            # Store reconstructed tile and its position
+            reconstructed_tiles.append((tile_reconstructed, position))
+        
+        # Merge tiles back into full image
+        reconstructed_image = self.merge_tiles(reconstructed_tiles, corrupted_image.shape)
+        
+        return reconstructed_image
